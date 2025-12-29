@@ -3,6 +3,7 @@
 
 示例用法:
 ```
+# 完整流程：包含slide encoder推理
 python run_slide_encoder_inference.py \
     --slide_path output/wsis/394140.svs \
     --job_dir output/ \
@@ -13,6 +14,16 @@ python run_slide_encoder_inference.py \
     --patch_encoder_weights_path path/to/patch_encoder_weights.pt \
     --slide_encoder threads \
     --slide_encoder_weights_path path/to/slide_encoder_weights.pt
+
+# 仅提取特征（不执行slide encoder推理）
+python run_slide_encoder_inference.py \
+    --slide_path output/wsis/394140.svs \
+    --job_dir output/ \
+    --mag 20 \
+    --patch_size 256 \
+    --patch_encoder uni_v2 \
+    --patch_encoder_weights_path path/to/patch_encoder_weights.pt \
+    --extract_features_only
 ```
 
 """
@@ -32,7 +43,7 @@ def parse_arguments():
     """
     解析命令行参数
     """
-    parser = argparse.ArgumentParser(description="使用TRIDENT处理WSI并通过slide_encoder进行推理")
+    parser = argparse.ArgumentParser(description="使用TRIDENT处理WSI并提取特征或通过slide_encoder进行推理")
     
     # 基本参数
     parser.add_argument("--gpu", type=int, default=0, help="使用的GPU索引")
@@ -76,15 +87,19 @@ def parse_arguments():
                         help='特征提取的batch size')
     
     # Slide encoder参数
-    parser.add_argument('--slide_encoder', type=str, default='gfy_abmil', required=True,
+    parser.add_argument('--slide_encoder', type=str, default='gfy_abmil',
                         choices=['threads', 'titan', 'prism', 'gigapath', 'chief', 'madeleine', 'feather',
                                  'mean-virchow', 'mean-virchow2', 'mean-conch_v1', 'mean-conch_v15', 
                                  'mean-ctranspath', 'mean-gigapath', 'mean-resnet50', 'mean-hoptimus0', 
                                  'mean-phikon', 'mean-phikon_v2', 'mean-musk', 'mean-uni_v1', 'mean-uni_v2',
                                  'gfy_abmil'],
-                        help='使用的slide encoder')
+                        help='使用的slide encoder（当--extract_features_only时可选）')
     parser.add_argument('--slide_encoder_weights_path', type=str,
-                        help='Slide encoder权重路径（可选，显式指定权重文件路径）')
+                        help='Slide encoder权重路径（当--extract_features_only时可选）')
+    
+    # 特征提取模式
+    parser.add_argument('--extract_features_only', action='store_true', default=False,
+                        help='仅提取patch特征，不执行slide encoder推理')
     
     # 其他参数
     parser.add_argument('--custom_mpp_keys', type=str, nargs='+', default=None,
@@ -92,7 +107,14 @@ def parse_arguments():
     parser.add_argument('--save_slide_features', action='store_true', default=False,
                         help='是否保存slide features到文件')
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # 参数验证：如果不是仅提取特征模式，slide_encoder_weights_path是必需的
+    if not args.extract_features_only:
+        if args.slide_encoder_weights_path is None:
+            parser.error("当未使用--extract_features_only时，--slide_encoder_weights_path是必需的")
+    
+    return args
 
 
 def load_segmentation_model_with_weights(segmenter_name, weights_path=None, confidence_thresh=0.5, device='cuda:0'):
@@ -218,13 +240,13 @@ def load_slide_encoder_with_weights(slide_encoder_name, weights_path, pretrained
 
 def process_slide_with_slide_encoder(args):
     """
-    处理单个WSI：seg -> coords -> feat -> slide_encoder推理
+    处理单个WSI：seg -> coords -> feat -> (可选)slide_encoder推理
     
     Args:
         args: 命令行参数
     
     Returns:
-        slide features (numpy array)
+        slide features (numpy array) 或 None（如果仅提取特征）
     """
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
     
@@ -329,8 +351,16 @@ def process_slide_with_slide_encoder(args):
         )
         print(f"Patch特征提取完成。保存至 {patch_features_path}")
     
+    # 如果仅提取特征模式，直接返回
+    if args.extract_features_only:
+        print(f"特征提取模式：已保存patch特征至 {patch_features_h5_path}")
+        print("跳过slide encoder推理步骤")
+        return None
+    
     # 步骤5: 加载slide encoder并加载权重
     print(f"正在加载slide encoder: {args.slide_encoder}")
+    if args.slide_encoder_weights_path is None:
+        raise ValueError("当未使用--extract_features_only时，--slide_encoder_weights_path是必需的")
     if not os.path.exists(args.slide_encoder_weights_path):
         raise FileNotFoundError(f"Slide encoder权重文件不存在: {args.slide_encoder_weights_path}")
     slide_encoder = load_slide_encoder_with_weights(
