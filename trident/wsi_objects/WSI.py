@@ -1185,6 +1185,107 @@ class WSI:
 
         return save_path
 
+    def visualize_attention_heatmap(
+        self,
+        attention_scores: np.ndarray,
+        coords: np.ndarray,
+        patch_size_level0: int,
+        save_path: str = None,
+        output_dir: str = None,
+        vis_level: int = -1,
+        cmap: str = 'coolwarm',
+        alpha: float = 0.4,
+        blank_canvas: bool = False,
+        blur: bool = False,
+        overlap: int = 0,
+        normalize: bool = True,
+        convert_to_percentiles: bool = False,
+        binarize: bool = False,
+        thresh: float = 0.5,
+        num_top_patches_to_save: int = -1,
+        filename: Optional[str] = None,
+    ) -> str:
+        """
+        Visualize attention heatmap on the WSI.
+        
+        This method wraps the visualize_heatmap function from trident.Visualization,
+        following the same API as shown in the tutorial notebook.
+        
+        Args:
+            attention_scores (np.ndarray): Attention scores for each patch, shape (N,) or (N, 1)
+            coords (np.ndarray): Patch coordinates at level 0, shape (N, 2)
+            patch_size_level0 (int): Patch size at level 0
+            save_path (str, optional): Path to save the heatmap image (deprecated, use output_dir)
+            output_dir (str, optional): Directory to save heatmap. Defaults to current directory.
+            vis_level (int, optional): Visualization level. If -1, auto-determined. Defaults to -1.
+            cmap (str, optional): Colormap name. Defaults to 'coolwarm'.
+            alpha (float, optional): Alpha blending factor. Defaults to 0.4.
+            blank_canvas (bool, optional): Use blank canvas instead of WSI. Defaults to False.
+            blur (bool, optional): Apply Gaussian blur to heatmap. Defaults to False.
+            overlap (int, optional): Overlap between patches in pixels. Defaults to 0.
+            normalize (bool, optional): Whether to normalize scores using rank. Defaults to True.
+            convert_to_percentiles (bool, optional): Convert scores to percentiles. Defaults to False.
+            binarize (bool, optional): Binarize the heatmap. Defaults to False.
+            thresh (float, optional): Threshold for binarization (0-1). Defaults to 0.5.
+            num_top_patches_to_save (int, optional): Number of top patches to save. Defaults to -1.
+            filename (Optional[str], optional): Custom filename for the heatmap. If None, defaults to "heatmap.png".
+        
+        Returns:
+            str: Path to the saved heatmap image.
+        
+        Example:
+            >>> # After getting attention scores from a model
+            >>> wsi.visualize_attention_heatmap(
+            ...     attention_scores=attention_scores,
+            ...     coords=coords,
+            ...     patch_size_level0=256,
+            ...     output_dir='output/heatmaps'
+            ... )
+        """
+        from trident.Visualization import visualize_heatmap
+        
+        self._lazy_initialize()
+        
+        # Ensure scores are 1D
+        if attention_scores.ndim > 1:
+            attention_scores = attention_scores.squeeze()
+    
+        # Determine output directory
+        if output_dir is None:
+            if save_path is not None:
+                # Extract directory from save_path for backward compatibility
+                output_dir = os.path.dirname(save_path) if os.path.dirname(save_path) else "."
+            else:
+                output_dir = "."
+        
+        # Handle vis_level == -1 (use a reasonable default)
+        if vis_level == -1:
+            # Use level 4 as default (similar to CLAM), or the highest available level
+            vis_level = min(4, len(self.level_downsamples) - 1)
+        
+        # Call visualize_heatmap with correct parameters
+        heatmap_path = visualize_heatmap(
+            wsi=self,
+            scores=attention_scores,
+            coords=coords,
+            patch_size_level0=patch_size_level0,
+            vis_level=vis_level,
+            cmap=cmap,
+            normalize=normalize,
+            num_top_patches_to_save=num_top_patches_to_save,
+            output_dir=output_dir,
+            alpha=alpha,
+            blank_canvas=blank_canvas,
+            blur=blur,
+            overlap=overlap,
+            convert_to_percentiles=convert_to_percentiles,
+            binarize=binarize,
+            thresh=thresh,
+            filename=filename,
+        )
+        
+        return heatmap_path
+
     def release(self) -> None:
         """
         Release internal data (CPU/GPU/memory) and clear heavy references in the WSI instance.
