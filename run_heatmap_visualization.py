@@ -86,7 +86,7 @@ def parse_arguments():
                         help='特征提取的batch size')
     
     # Slide encoder参数
-    parser.add_argument('--slide_encoder', type=str, required=True,
+    parser.add_argument('--slide_encoder', type=str, default=None,
                         choices=['threads', 'titan', 'prism', 'gigapath', 'chief', 
                                  'madeleine', 'feather', 'gfy_abmil','gfy_transmil',
                                  'mean-virchow', 'mean-virchow2', 'mean-conch_v1', 
@@ -94,8 +94,14 @@ def parse_arguments():
                                  'mean-resnet50', 'mean-hoptimus0', 'mean-phikon', 
                                  'mean-phikon_v2', 'mean-musk', 'mean-uni_v1', 'mean-uni_v2'],
                         help='使用的slide encoder（用于生成attention）')
-    parser.add_argument('--slide_encoder_weights_path', type=str, required=True,
-                        help='Slide encoder权重路径（必需）')
+    parser.add_argument('--slide_encoder_weights_path', type=str, default=None,
+                        help='Slide encoder权重路径（未使用--attention_from_file时必需）')
+    
+    # Attention map加载参数
+    parser.add_argument('--attention_from_file', action='store_true', default=False,
+                        help='从保存的文件加载attention map而非重新计算')
+    parser.add_argument('--attention_map_path', type=str, default=None,
+                        help='保存的attention map NPZ文件路径（当--attention_from_file时使用）')
     
     # Heatmap可视化参数
     parser.add_argument('--vis_level', type=int, default=4,
@@ -228,6 +234,9 @@ def get_attention_scores_from_model(
 def process_slide_and_generate_heatmap(args):
     """
     处理单个WSI并生成heatmap
+    支持两种模式：
+    1. 从slide encoder重新计算attention（原始模式）
+    2. 从保存的NPZ文件加载attention map（新增）
     """
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
     
@@ -255,7 +264,7 @@ def process_slide_and_generate_heatmap(args):
     
     # 步骤2: 组织分割
     if not os.path.exists(seg_output_path):
-        print("步骤1/5: 正在运行组织分割...")
+        print("步骤1/4: 正在运行组织分割...")
         segmentation_model = segmentation_model_factory(
             model_name=args.segmenter,
             confidence_thresh=args.seg_conf_thresh,
@@ -271,14 +280,14 @@ def process_slide_and_generate_heatmap(args):
         )
         print(f"组织分割完成。结果保存至 {seg_output_path}")
     else:
-        print(f"步骤1/5: 组织分割结果已存在，跳过: {seg_output_path}")
+        print(f"步骤1/4: 组织分割结果已存在，跳过: {seg_output_path}")
     
     # 步骤3: 提取组织坐标
     save_coords = os.path.join(args.job_dir, f'{args.mag}x_{args.patch_size}px_{args.overlap}px_overlap')
     coords_path = os.path.join(save_coords, 'patches', f'{slide.name}_patches.h5')
     
     if not os.path.exists(coords_path):
-        print("步骤2/5: 正在提取组织坐标...")
+        print("步骤2/4: 正在提取组织坐标...")
         coords_path = slide.extract_tissue_coords(
             target_mag=args.mag,
             patch_size=args.patch_size,
@@ -287,71 +296,112 @@ def process_slide_and_generate_heatmap(args):
         )
         print(f"组织坐标提取完成。保存至 {coords_path}")
     else:
-        print(f"步骤2/5: 组织坐标文件已存在，跳过: {coords_path}")
+        print(f"步骤2/4: 组织坐标文件已存在，跳过: {coords_path}")
     
-    # 步骤4: 提取patch特征
-    features_dir = os.path.join(save_coords, f"features_{args.patch_encoder}")
-    patch_features_h5_path = os.path.join(features_dir, f'{slide.name}.h5')
-    
-    if not os.path.exists(patch_features_h5_path):
-        print("步骤3/5: 正在提取patch特征...")
-        
-        if args.patch_encoder_weights_path:
-            patch_encoder = encoder_factory(args.patch_encoder, weights_path=args.patch_encoder_weights_path)
-        else:
-            patch_encoder = encoder_factory(args.patch_encoder)
-        patch_encoder.eval()
-        patch_encoder.to(device)
-        
-        patch_features_path = slide.extract_patch_features(
-            patch_encoder=patch_encoder,
-            coords_path=coords_path,
-            save_features=features_dir,
-            device=device,
-            batch_limit=args.batch_size
-        )
-        print(f"Patch特征提取完成。保存至 {patch_features_path}")
-    else:
-        print(f"步骤3/5: Patch特征文件已存在，跳过: {patch_features_h5_path}")
-    
-    # 步骤5: 加载slide encoder并获取attention scores
-    print(f"步骤4/5: 正在加载slide encoder: {args.slide_encoder}")
-    slide_encoder = load_slide_encoder_with_weights(
-        slide_encoder_name=args.slide_encoder,
-        weights_path=args.slide_encoder_weights_path,
-        device=device
-    )
-    
-    # 加载patch features
-    with h5py.File(patch_features_h5_path, 'r') as f:
+    # 加载coords
+    with h5py.File(coords_path, 'r') as f:
         coords = f['coords'][:]
-        patch_features = f['features'][:]
         coords_attrs = dict(f['coords'].attrs)
     
-    print(f"获取attention scores (共{len(coords)}个patches)...")
-    attention_scores = get_attention_scores_from_model(
-        model=slide_encoder,
-        patch_features=patch_features,
-        coords=coords,
-        coords_attrs=coords_attrs,
-        device=device
-    )
+    # 模式A: 从保存的attention map文件加载
+    if args.attention_from_file:
+        print(f"步骤3/4: 从文件加载attention map...")
+        if args.attention_map_path is None:
+            # 尝试自动查找
+            default_attention_path = os.path.join(
+                args.job_dir, 'attention_maps', f'{slide_name}_attention.npz'
+            )
+            if os.path.exists(default_attention_path):
+                args.attention_map_path = default_attention_path
+            else:
+                raise FileNotFoundError(
+                    f"未指定attention_map_path且自动查找失败: {default_attention_path}"
+                )
+        
+        if not os.path.exists(args.attention_map_path):
+            raise FileNotFoundError(f"Attention map文件不存在: {args.attention_map_path}")
+        
+        # 加载NPZ文件
+        data = np.load(args.attention_map_path)
+        attention_scores = data['attention_weights']
+        loaded_coords = data['coords']
+        
+        # 验证坐标是否匹配
+        if len(attention_scores) != len(coords):
+            print(f"警告: 加载的attention map中有{len(attention_scores)}个patches，"
+                  f"但当前slide有{len(coords)}个patches")
+        
+        print(f"成功加载attention map，包含{len(attention_scores)}个patches")
     
-    # 保存attention scores（可选）
-    if args.save_attention_scores:
-        attention_save_path = os.path.join(args.heatmap_save_dir, f'{slide_name}_attention_scores.h5')
-        with h5py.File(attention_save_path, 'w') as f:
-            f.create_dataset('attention_scores', data=attention_scores)
-            f.create_dataset('coords', data=coords)
-            for key, val in coords_attrs.items():
-                try:
-                    f['coords'].attrs[key] = val
-                except:
-                    pass
-        print(f"Attention scores已保存至: {attention_save_path}")
+    # 模式B: 从slide encoder重新计算attention
+    else:
+        print(f"步骤3/4: 从slide encoder计算attention...")
+        
+        # 步骤4: 提取patch特征
+        features_dir = os.path.join(save_coords, f"features_{args.patch_encoder}")
+        patch_features_h5_path = os.path.join(features_dir, f'{slide.name}.h5')
+        
+        if not os.path.exists(patch_features_h5_path):
+            print("正在提取patch特征...")
+            
+            if args.patch_encoder_weights_path:
+                patch_encoder = encoder_factory(args.patch_encoder, weights_path=args.patch_encoder_weights_path)
+            else:
+                patch_encoder = encoder_factory(args.patch_encoder)
+            patch_encoder.eval()
+            patch_encoder.to(device)
+            
+            patch_features_path = slide.extract_patch_features(
+                patch_encoder=patch_encoder,
+                coords_path=coords_path,
+                save_features=features_dir,
+                device=device,
+                batch_limit=args.batch_size
+            )
+            print(f"Patch特征提取完成。保存至 {patch_features_path}")
+        else:
+            print(f"Patch特征文件已存在，跳过: {patch_features_h5_path}")
+        
+        # 加载slide encoder
+        if args.slide_encoder is None or args.slide_encoder_weights_path is None:
+            raise ValueError(
+                "未使用--attention_from_file时，必须指定--slide_encoder和--slide_encoder_weights_path"
+            )
+        
+        slide_encoder = load_slide_encoder_with_weights(
+            slide_encoder_name=args.slide_encoder,
+            weights_path=args.slide_encoder_weights_path,
+            device=device
+        )
+        
+        # 加载patch features
+        with h5py.File(patch_features_h5_path, 'r') as f:
+            patch_features = f['features'][:]
+        
+        print(f"获取attention scores (共{len(coords)}个patches)...")
+        attention_scores = get_attention_scores_from_model(
+            model=slide_encoder,
+            patch_features=patch_features,
+            coords=coords,
+            coords_attrs=coords_attrs,
+            device=device
+        )
+        
+        # 保存attention scores（可选）
+        if args.save_attention_scores:
+            attention_save_path = os.path.join(args.heatmap_save_dir, f'{slide_name}_attention_scores.h5')
+            with h5py.File(attention_save_path, 'w') as f:
+                f.create_dataset('attention_scores', data=attention_scores)
+                f.create_dataset('coords', data=coords)
+                for key, val in coords_attrs.items():
+                    try:
+                        f['coords'].attrs[key] = val
+                    except:
+                        pass
+            print(f"Attention scores已保存至: {attention_save_path}")
     
-    # 步骤6: 生成heatmap可视化
-    print(f"步骤5/5: 正在生成heatmap可视化...")
+    # 步骤4: 生成heatmap可视化
+    print(f"步骤4/4: 正在生成heatmap可视化...")
     
     # 使用 slide_name 作为文件名，以区分不同的 slide
     heatmap_filename = f"{slide_name}_heatmap.png"
@@ -389,6 +439,19 @@ def process_slide_and_generate_heatmap(args):
 
 def main():
     args = parse_arguments()
+    
+    # 参数验证
+    if not args.attention_from_file:
+        # 模式B: 从slide encoder计算
+        if args.slide_encoder is None or args.slide_encoder_weights_path is None:
+            raise ValueError(
+                "当未使用--attention_from_file时，必须指定--slide_encoder和--slide_encoder_weights_path"
+            )
+    else:
+        # 模式A: 从文件加载
+        if args.attention_map_path is None:
+            # 尝试自动查找，如果找不到会在process函数中报错
+            pass
     
     # 创建输出目录
     os.makedirs(args.job_dir, exist_ok=True)

@@ -142,6 +142,7 @@ class GFYABMILSlideEncoder(BaseSlideEncoder):
         """
         super().__init__(freeze=False)
         self.enc_name = 'gfy_abmil'
+        self.return_attention = False  # 是否返回attention weights
 
     def _build(self, pretrained=True):
         """
@@ -166,11 +167,26 @@ class GFYABMILSlideEncoder(BaseSlideEncoder):
 
         return model, torch.float32, 768
 
-    def forward(self, batch, device='cuda'):
+    def forward(self, batch, device='cuda', return_raw_attention=False):
         """
         GFYABMIL forward.
+        
+        Args:
+            batch: 输入batch字典（包含features等）
+            device: 设备类型
+            return_raw_attention: 是否返回attention weights
+            
+        Returns:
+            如果return_raw_attention为True，返回[logits, attention_weights]
+            否则返回logits
         """
-        return self.model(batch['features'].to(device))
+        # 确定是否返回attention
+        should_return_attn = return_raw_attention or getattr(self, 'return_attention', False)
+        
+        # 调用模型forward
+        result = self.model(batch['features'].to(device), return_attn=should_return_attn)
+        
+        return result
 
 class ABMILSlideEncoder(BaseSlideEncoder):
 

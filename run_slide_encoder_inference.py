@@ -32,6 +32,9 @@ import os
 import torch
 import numpy as np
 import h5py
+import json
+from matplotlib import pyplot as plt
+from matplotlib.colors import Normalize
 
 from trident import load_wsi
 from trident.segmentation_models import segmentation_model_factory
@@ -100,6 +103,13 @@ def parse_arguments():
     # 特征提取模式
     parser.add_argument('--extract_features_only', action='store_true', default=False,
                         help='仅提取patch特征，不执行slide encoder推理')
+    
+    # Attention map参数
+    parser.add_argument('--save_attention_map', action='store_true', default=False,
+                        help='是否保存attention map')
+    parser.add_argument('--attention_map_type', type=str, default='heatmap',
+                        choices=['heatmap', 'spatial', 'both'],
+                        help='Attention map的保存类型：heatmap(热力图)，spatial(空间分布)，both(两者)')
     
     # 其他参数
     parser.add_argument('--custom_mpp_keys', type=str, nargs='+', default=None,
@@ -175,7 +185,138 @@ def load_segmentation_model_with_weights(segmenter_name, weights_path=None, conf
     return segmentation_model
 
 
-def load_slide_encoder_with_weights(slide_encoder_name, weights_path, pretrained=False, device='cuda:0'):
+def save_attention_heatmap(attention_weights, coords, slide_name, output_dir, patch_size):
+    """
+    保存attention热力图
+    
+    Args:
+        attention_weights: 注意力权重 (n_patches,)
+        coords: patch坐标 (n_patches, 2) [x, y]
+        slide_name: slide名称
+        output_dir: 输出目录
+        patch_size: patch大小
+    """
+    os.makedirs(os.path.join(output_dir, 'attention_maps'), exist_ok=True)
+    
+    # 归一化attention weights到0-1
+    attn_min = attention_weights.min()
+    attn_max = attention_weights.max()
+    attn_norm = (attention_weights - attn_min) / (attn_max - attn_min + 1e-8)
+    
+    # 计算grid大小
+    if len(coords) > 0:
+        max_x = coords[:, 0].max() + patch_size
+        max_y = coords[:, 1].max() + patch_size
+        grid_x = int(np.ceil(max_x / patch_size))
+        grid_y = int(np.ceil(max_y / patch_size))
+    else:
+        return
+    
+    # 创建热力图
+    heatmap = np.zeros((grid_y, grid_x))
+    for i, (x, y) in enumerate(coords):
+        grid_x_idx = int(x / patch_size)
+        grid_y_idx = int(y / patch_size)
+        if 0 <= grid_x_idx < heatmap.shape[1] and 0 <= grid_y_idx < heatmap.shape[0]:
+            heatmap[grid_y_idx, grid_x_idx] = attn_norm[i]
+    
+    # 绘制热力图
+    plt.figure(figsize=(12, 10))
+    im = plt.imshow(heatmap, cmap='hot', interpolation='nearest')
+    plt.colorbar(im, label='Attention Weight')
+    plt.title(f'Attention Heatmap - {slide_name}')
+    plt.xlabel('X (patch indices)')
+    plt.ylabel('Y (patch indices)')
+    
+    # 保存
+    heatmap_path = os.path.join(output_dir, 'attention_maps', f'{slide_name}_heatmap.png')
+    plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Attention热力图已保存: {heatmap_path}")
+    
+    return heatmap_path
+
+
+def save_attention_spatial_plot(attention_weights, coords, slide_name, output_dir, patch_size):
+    """
+    保存attention空间分布图
+    
+    Args:
+        attention_weights: 注意力权重 (n_patches,)
+        coords: patch坐标 (n_patches, 2) [x, y]
+        slide_name: slide名称
+        output_dir: 输出目录
+        patch_size: patch大小
+    """
+    os.makedirs(os.path.join(output_dir, 'attention_maps'), exist_ok=True)
+    
+    # 归一化attention weights
+    attn_min = attention_weights.min()
+    attn_max = attention_weights.max()
+    attn_norm = (attention_weights - attn_min) / (attn_max - attn_min + 1e-8)
+    
+    # 绘制空间分布
+    plt.figure(figsize=(12, 10))
+    scatter = plt.scatter(coords[:, 0], coords[:, 1], c=attn_norm, cmap='hot', s=100, alpha=0.6)
+    plt.colorbar(scatter, label='Attention Weight')
+    plt.title(f'Attention Spatial Distribution - {slide_name}')
+    plt.xlabel('X coordinate (pixels)')
+    plt.ylabel('Y coordinate (pixels)')
+    plt.gca().invert_yaxis()  # 反转Y轴以匹配图像坐标
+    
+    # 保存
+    spatial_path = os.path.join(output_dir, 'attention_maps', f'{slide_name}_spatial.png')
+    plt.savefig(spatial_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Attention空间分布图已保存: {spatial_path}")
+    
+    return spatial_path
+
+
+def save_attention_weights(attention_weights, coords, slide_name, output_dir, patch_size=None):
+    """
+    保存attention权重为JSON和NPZ格式
+    
+    Args:
+        attention_weights: 注意力权重 (n_patches,)
+        coords: patch坐标 (n_patches, 2) [x, y]
+        slide_name: slide名称
+        output_dir: 输出目录
+        patch_size: patch大小（可选）
+    """
+    os.makedirs(os.path.join(output_dir, 'attention_maps'), exist_ok=True)
+    
+    # 保存为NPZ格式（便于后续加载）
+    npz_path = os.path.join(output_dir, 'attention_maps', f'{slide_name}_attention.npz')
+    np.savez(npz_path, 
+             attention_weights=attention_weights,
+             coords=coords)
+    print(f"Attention权重已保存为NPZ: {npz_path}")
+    
+    # 保存元数据为JSON
+    metadata = {
+        'slide_name': slide_name,
+        'n_patches': len(attention_weights),
+        'attention_stats': {
+            'min': float(attention_weights.min()),
+            'max': float(attention_weights.max()),
+            'mean': float(attention_weights.mean()),
+            'std': float(attention_weights.std())
+        },
+        'patch_size': patch_size
+    }
+    
+    json_path = os.path.join(output_dir, 'attention_maps', f'{slide_name}_attention_meta.json')
+    with open(json_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Attention元数据已保存为JSON: {json_path}")
+    
+    return npz_path, json_path
+
+
+def load_slide_encoder_with_weights(slide_encoder_name, weights_path, pretrained=False, device='cuda:0', return_attention=False):
     """
     加载slide encoder模型并加载自定义权重
     
@@ -234,6 +375,9 @@ def load_slide_encoder_with_weights(slide_encoder_name, weights_path, pretrained
     
     slide_encoder.to(device)
     slide_encoder.eval()
+    
+    # 记录是否需要返回attention
+    slide_encoder.return_attention = return_attention
     
     return slide_encoder
 
@@ -367,7 +511,8 @@ def process_slide_with_slide_encoder(args):
         slide_encoder_name=args.slide_encoder,
         weights_path=args.slide_encoder_weights_path,
         pretrained=False,  # 使用自定义权重，不使用预训练
-        device=device
+        device=device,
+        return_attention=args.save_attention_map
     )
     
     # 步骤6: 使用slide encoder处理patch features
@@ -394,9 +539,23 @@ def process_slide_with_slide_encoder(args):
     }
     
     # 完成下游任务
+    attention_weights = None
     with torch.no_grad():
         with torch.autocast(device_type='cuda', enabled=(slide_encoder.precision != torch.float32)):
-            slide_features = slide_encoder(batch, device=device)
+            if args.save_attention_map:
+                # 对于GFYABMIL等支持返回attention的模型
+                if hasattr(slide_encoder.model, 'forward') and 'return_attn' in slide_encoder.model.forward.__code__.co_varnames:
+                    result = slide_encoder.model(patch_features, return_attn=True)
+                    if isinstance(result, list):
+                        slide_features = result[0]
+                        attention_weights = result[1]
+                    else:
+                        slide_features = result
+                else:
+                    # 其他模型可能不支持attention返回
+                    slide_features = slide_encoder(batch, device=device)
+            else:
+                slide_features = slide_encoder(batch, device=device)
         slide_features = slide_features.float().cpu()
     
     if slide_features.ndim == 1:
@@ -404,6 +563,48 @@ def process_slide_with_slide_encoder(args):
     prob = torch.softmax(slide_features, dim=-1).numpy()
     
     print(f"下游任务完成。结果: {prob}")
+    
+    # 步骤7: 保存attention map（如果启用）
+    if args.save_attention_map and attention_weights is not None:
+        print("正在保存attention map...")
+        
+        # 将attention权重转换为numpy
+        if isinstance(attention_weights, torch.Tensor):
+            attention_weights = attention_weights.cpu().numpy().squeeze()
+        
+        coords_np = coords.squeeze(0).cpu().numpy()
+        
+        # 保存权重数据
+        save_attention_weights(
+            attention_weights=attention_weights,
+            coords=coords_np,
+            slide_name=slide_name,
+            output_dir=args.job_dir,
+            patch_size=args.patch_size
+        )
+        
+        # 生成热力图
+        if args.attention_map_type in ['heatmap', 'both']:
+            save_attention_heatmap(
+                attention_weights=attention_weights,
+                coords=coords_np,
+                slide_name=slide_name,
+                output_dir=args.job_dir,
+                patch_size=args.patch_size
+            )
+        
+        # 生成空间分布图
+        if args.attention_map_type in ['spatial', 'both']:
+            save_attention_spatial_plot(
+                attention_weights=attention_weights,
+                coords=coords_np,
+                slide_name=slide_name,
+                output_dir=args.job_dir,
+                patch_size=args.patch_size
+            )
+        
+        print("Attention map保存完成")
+    
     return prob
 
 
